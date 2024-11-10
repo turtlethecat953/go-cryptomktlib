@@ -1,61 +1,98 @@
 package base
 
 import (
+	"context"
 	"fmt"
 	"github.com/gorilla/websocket"
+	"log"
+	"os"
+	"sync"
 	"time"
 )
 
+type wsSignal int
+
+const (
+	TERM wsSignal = iota
+)
+
 type WsClient struct {
-	baseUrl string
 	conn    *websocket.Conn
+	logger  *log.Logger
+	closed  bool
+	verbose bool
 }
 
-func NewWsClient(baseUrl string, handleMessage func([]byte)) *WsClient {
-	ws := &WsClient{baseUrl: baseUrl}
+func NewWsClient(
+	ctx context.Context,
+	wg *sync.WaitGroup,
+	baseUrl string,
+	handleMessage func([]byte),
+	onClose func(),
+	verbose bool) *WsClient {
+	logger := log.New(os.Stdout, "", log.Ldate|log.Lmicroseconds)
+
+	ws := &WsClient{
+		logger:  logger,
+		verbose: verbose,
+		closed:  false}
 
 	Dialer := websocket.Dialer{
 		HandshakeTimeout:  45 * time.Second,
 		EnableCompression: false,
 	}
-	fmt.Printf("Base URL %s", baseUrl)
+	ws.log("Connecting to %s", baseUrl)
 	c, _, err := Dialer.Dial(baseUrl, nil)
 	if err != nil {
 		panic(err)
 	}
 	c.SetReadLimit(655350)
 	ws.conn = c
-	//doneC := make(chan struct{})
-	//stopC := make(chan struct{})
-	go func() {
-		// This function will exit either on error from
-		// websocket.Conn.ReadMessage or when the stopC channel is
-		// closed by the client.
-		defer c.Close()
-		// Wait for the stopC channel to be closed.  We do that in a
-		// separate goroutine because ReadMessage is a blocking
-		// operation.
-		silent := false
-		//go func() {
-		//	select {
-		//	case <-stopC:
-		//		silent = true
-		//	case <-doneC:
-		//	}
-		//	c.Close()
-		//}()
-		for {
-			_, message, err := c.ReadMessage()
+	wg.Add(1)
+	go ws.readLoop(ctx, handleMessage, onClose)
+	return ws
+}
+
+func (w *WsClient) log(format string, v ...interface{}) {
+	if w.verbose {
+		w.logger.Printf(format, v...)
+	}
+}
+
+func (w *WsClient) close() {
+	if w.conn == nil {
+		w.log("Trying to close a closed connection...")
+	}
+	err := w.conn.Close()
+	if err != nil {
+		fmt.Printf("Error During Closing Websocket Connection %v", err)
+	}
+	w.log("Closed Websocket Client")
+	w.closed = true
+}
+
+func (w *WsClient) readLoop(ctx context.Context, handleMessage func([]byte), onClose func()) {
+	defer func() {
+		onClose()
+		w.close()
+	}()
+	for {
+		select {
+		case <-ctx.Done():
+			w.log("Stopping ReadLoop Gracefully...")
+			return
+		default:
+			_, message, err := w.conn.ReadMessage()
 			if err != nil {
-				if !silent {
-					fmt.Printf("Error %v", err)
-				}
+				w.log("Closing ReadLoop due to Irrecoverable Error %v", err)
+				return
+			}
+			if w.closed {
 				return
 			}
 			handleMessage(message)
 		}
-	}()
-	return ws
+	}
 }
 
 func (w *WsClient) SendMessage(data []byte) error {

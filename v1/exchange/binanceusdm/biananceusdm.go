@@ -7,6 +7,7 @@ import (
 	"go-cryptomktlib/v1/base"
 	"go-cryptomktlib/v1/data"
 	"net/http"
+	"sync"
 )
 
 const TEST_URL = "https://testnet.binancefuture.com"
@@ -14,6 +15,8 @@ const TEST_WS_URL = "wss://fstream.binancefuture.com"
 const WS_URL = "wss://fstream.binance.com"
 
 type Binanceusdm struct {
+	ctx        context.Context
+	wg         *sync.WaitGroup
 	key        string
 	secret     string
 	httpClient *base.Client
@@ -22,8 +25,8 @@ type Binanceusdm struct {
 	handleChan map[string]chan<- interface{}
 }
 
-func NewBinanceusdm(key, secret string, verbose bool) *Binanceusdm {
-	return &Binanceusdm{key: key, secret: secret, verbose: verbose, handleChan: make(map[string]chan<- interface{})}
+func NewBinanceusdm(ctx context.Context, wg *sync.WaitGroup, key, secret string, verbose bool) *Binanceusdm {
+	return &Binanceusdm{ctx: ctx, wg: wg, key: key, secret: secret, verbose: verbose, handleChan: make(map[string]chan<- interface{})}
 }
 
 func (exchange *Binanceusdm) httpConnect() error {
@@ -117,26 +120,6 @@ func (exchange *Binanceusdm) FetchOrderBook(ctx context.Context, symbol string) 
 	return data.ToOrderBook(&jsonResponse), &jsonResponse, nil
 }
 
-func (exchange *Binanceusdm) handleMessage(message []byte) {
-	jsonMap := make(map[string]interface{})
-	err := json.Unmarshal(message, &jsonMap)
-	if err != nil {
-		panic(err)
-	}
-	fmt.Printf("%v", jsonMap)
-	eventType, ok := jsonMap["e"]
-	if ok {
-		if eventType == "depthUpdate" {
-			ch, ok := exchange.handleChan["partialDiff"]
-			if ok {
-				jsonResponse := PartialBookDepth{}
-				err = json.Unmarshal(message, &jsonResponse)
-				ch <- data.ToOrderBook(&jsonResponse)
-			}
-		}
-	}
-}
-
 func (exchange *Binanceusdm) stream() string {
 	return "0"
 }
@@ -145,12 +128,42 @@ func (exchange *Binanceusdm) connect() error {
 	if exchange.wsClient != nil {
 		return nil
 	}
-	w := base.NewWsClient(WS_URL+"/ws/"+exchange.stream(), exchange.handleMessage)
+	w := base.NewWsClient(exchange.ctx, exchange.wg, TEST_WS_URL+"/ws/"+exchange.stream(),
+		exchange.handleMessage, exchange.onClose, exchange.verbose)
 	exchange.wsClient = w
 	return nil
 }
 
-func (exchange *Binanceusdm) WatchOrderBook(ch chan<- interface{}) error {
+func (exchange *Binanceusdm) onClose() {
+	fmt.Printf("Try to close all ch\n")
+	for key, ch := range exchange.handleChan {
+		close(ch)
+		delete(exchange.handleChan, key)
+	}
+}
+
+func (exchange *Binanceusdm) handleMessage(message []byte) {
+	jsonMap := make(map[string]interface{})
+	err := json.Unmarshal(message, &jsonMap)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("%v\n", jsonMap["E"])
+	eventType, ok := jsonMap["e"]
+	if ok {
+		if eventType == "depthUpdate" {
+			ch, ok := exchange.handleChan["partialDiff"]
+			if ok {
+				jsonResponse := PartialBookDepth{}
+				err = json.Unmarshal(message, &jsonResponse)
+				fmt.Println("Writing to CH")
+				ch <- data.ToOrderBook(&jsonResponse)
+			}
+		}
+	}
+}
+
+func (exchange *Binanceusdm) WatchOrderBook() chan interface{} {
 	_ = exchange.connect()
 
 	request := Request{
@@ -161,6 +174,7 @@ func (exchange *Binanceusdm) WatchOrderBook(ch chan<- interface{}) error {
 	s, _ := json.Marshal(request)
 	exchange.wsClient.SendMessage(s)
 
+	ch := make(chan interface{})
 	exchange.handleChan["partialDiff"] = ch
-	return nil
+	return ch
 }
