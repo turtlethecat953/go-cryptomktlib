@@ -10,12 +10,6 @@ import (
 	"time"
 )
 
-type wsSignal int
-
-const (
-	TERM wsSignal = iota
-)
-
 type WsClient struct {
 	conn    *websocket.Conn
 	logger  *log.Logger
@@ -49,7 +43,7 @@ func NewWsClient(
 	c.SetReadLimit(655350)
 	ws.conn = c
 	wg.Add(1)
-	go ws.readLoop(ctx, handleMessage, onClose)
+	go ws.readLoop(ctx, wg, handleMessage, onClose)
 	return ws
 }
 
@@ -71,10 +65,11 @@ func (w *WsClient) close() {
 	w.closed = true
 }
 
-func (w *WsClient) readLoop(ctx context.Context, handleMessage func([]byte), onClose func()) {
+func (w *WsClient) readLoop(ctx context.Context, wg *sync.WaitGroup, handleMessage func([]byte), onClose func()) {
 	defer func() {
 		onClose()
 		w.close()
+		wg.Done()
 	}()
 	for {
 		select {
@@ -82,6 +77,9 @@ func (w *WsClient) readLoop(ctx context.Context, handleMessage func([]byte), onC
 			w.log("Stopping ReadLoop Gracefully...")
 			return
 		default:
+			if ctx.Err() != nil {
+				return
+			}
 			_, message, err := w.conn.ReadMessage()
 			if err != nil {
 				w.log("Closing ReadLoop due to Irrecoverable Error %v", err)
